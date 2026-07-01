@@ -1,0 +1,13 @@
+# --- n8n runtime data: encryption key, database, credentials, installed node_modules ---
+n8n_data/
+
+# --- scraped output & personal application tracker — NEVER commit ---
+output/
+*.xlsx
+*.xls
+
+# --- misc ---
+node_modules/
+.DS_Store
+*.log
+/tmp/

@@ -1,0 +1,56 @@
+# =====================================================
+# n8n + Browserless Chrome — gotowy do scrapingu
+# =====================================================
+# Wszystko trzymamy w JEDNYM folderze (~/n8n-job-scraper):
+#   ./n8n_data  -> dane n8n (workflow, credentials)
+#   ./output    -> zescrapowane oferty w JSON
+# Start:  cd ~/n8n-job-scraper && docker compose up -d
+# n8n:    http://localhost:5678
+# =====================================================
+
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      # Puppeteer laczy sie z Browserless zamiast szukac lokalnego Chrome:
+      - PUPPETEER_BROWSER_WS_ENDPOINT=ws://browserless:3000
+      - PUPPETEER_PROTOCOL=cdp
+      # Pozwala Code nodom uzywac fs i path (zapis plikow):
+      - NODE_FUNCTION_ALLOW_BUILTIN=fs,path
+      # Pozwala Code nodom uzywac zewnetrznej biblioteki exceljs (zapis .xlsx z dropdownami):
+      - NODE_FUNCTION_ALLOW_EXTERNAL=exceljs
+      # Gdzie Node ma szukac exceljs (folder custom nodes):
+      - NODE_PATH=/home/node/.n8n/nodes/node_modules
+      # Strefa czasowa:
+      - GENERIC_TIMEZONE=Europe/Warsaw
+      - TZ=Europe/Warsaw
+    volumes:
+      # Dane n8n (workflow, credentials) — teraz widoczne w tym folderze:
+      - ./n8n_data:/home/node/.n8n
+      # Folder na scraped JSON — teraz w tym samym folderze:
+      - ./output:/output
+    depends_on:
+      - browserless
+    networks:
+      - n8n-net
+
+  browserless:
+    image: browserless/chrome:latest
+    restart: unless-stopped
+    environment:
+      # Limit rownoczesnych sesji Browserless (workflow i tak scrapuje po kolei):
+      - MAX_CONCURRENT_SESSIONS=5
+      # Timeout na sesje (w ms) — 5 minut:
+      - CONNECTION_TIMEOUT=300000
+      # Headless mode:
+      - DEFAULT_HEADLESS=true
+    # NIE wystawiamy portu 3000 na zewnatrz — tylko n8n uzywa go wewnetrznie:
+    networks:
+      - n8n-net
+
+networks:
+  n8n-net:
+    driver: bridge
