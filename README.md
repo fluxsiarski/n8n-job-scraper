@@ -24,13 +24,17 @@ Checking eight job sites by hand every morning is slow and demoralising. So I bu
 
 ## 🖼️ Screenshots
 
-> 📸 Add `workflow.png`, `config.png` and `excel-output.png` to [`docs/screenshots/`](docs/screenshots/) and they'll display here (see that folder's guide).
+**The workflow** — Config → 8 scrapers → Excel Writer, one browser at a time:
 
-<!-- Once the PNGs are added, uncomment this table:
-| Workflow | Config (one place to edit) | Excel output |
-|---|---|---|
-| ![Workflow](docs/screenshots/workflow.png) | ![Config](docs/screenshots/config.png) | ![Excel output](docs/screenshots/excel-output.png) |
--->
+![Workflow](docs/screenshots/workflow.png)
+
+**One config node controls everything** — edit the filters or paste a site URL:
+
+![Config](docs/screenshots/config.png)
+
+**The output** — a colour-coded Excel tracker with status dropdowns and clickable links:
+
+![Excel output](docs/screenshots/excel-output.png)
 
 ## 🏗️ How it works
 
