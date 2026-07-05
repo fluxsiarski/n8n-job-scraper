@@ -1,10 +1,16 @@
 // ====== JUSTJOIN.IT — official JSON API; honors pasted browser URL for filters ======
+// V3: after the list, fetch each offer page (same-origin fetch inside the open page),
+// extract the FULL plain-text description from the single ld+json JobPosting block,
+// plus (best-effort) requiredSkills/niceToHaveSkills from the RSC flight payload.
+// URL-keyed desc cache makes re-runs fast; multilocation dupes dedupe via the cache.
 const fs = require('fs');
 const cfg = JSON.parse(fs.readFileSync('/tmp/scrape_config.json', 'utf-8'));
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (a, b) => Math.floor(a + Math.random() * (b - a));
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const BLOCK = ['captcha', 'just a moment', 'cf-chl', 'datadome', 'access denied', 'attention required'];
+const nurl = (u) => String(u || '').split('?')[0].replace(/\/+$/, '').toLowerCase();
+const CACHE_PATH = cfg.descCache || '/output/desc_cache.json';
 
 // Filters: default from cfg.category; overridden by a pasted browser URL if present.
 const city = cfg.location || 'Wrocław';
@@ -23,6 +29,7 @@ if (ov) {
 
 let offers = [];
 let blocked = false;
+let details_fetched = 0, details_cached = 0, detail_errors = 0, detailAborted = false;
 const page = await $browser.newPage();
 try {
   await page.setUserAgent(UA);
@@ -69,6 +76,139 @@ try {
     }).filter(o => o.url);
   }
 } catch (e) {}
+
+// ====== DETAIL PHASE (V3) — full description per offer from the SSR offer page ======
+// No detail API exists (all 404, verified live). Each https://justjoin.it/job-offer/{slug}
+// is server-rendered and holds ONE <script type="application/ld+json"> with the full
+// plain-text description. One fetch = one page.evaluate; sleeps happen node-side.
+if (!blocked && offers.length) {
+  // Cache: read once (best-effort), key = nurl(url) — matches Excel Writer's dedup key.
+  let cache = {};
+  try { const c = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf-8')); if (c && typeof c === 'object') cache = c; } catch (e) {}
+
+  try {
+    for (const off of offers) {
+      if (detailAborted) break;
+      if (!off || !off.url) continue;
+      const key = nurl(off.url);
+
+      // Cache hit → reuse fields (also dedupes multilocation twins in the same run).
+      const hit = cache[key];
+      if (hit && hit.f && typeof hit.f.description === 'string' && hit.f.description) {
+        Object.assign(off, hit.f);
+        details_cached++;
+        continue;
+      }
+
+      // Politeness: jittered delay in Node context BEFORE each network hit.
+      await sleep(rand(800, 2500));
+
+      let res = null;
+      try {
+        res = await page.evaluate(async (u, BLOCK) => {
+          try {
+            // Hard 30s cap so this evaluate can never approach protocolTimeout.
+            const ctrl = new AbortController();
+            const tid = setTimeout(() => ctrl.abort(), 30000);
+            let html;
+            try {
+              const r = await fetch(u, { signal: ctrl.signal, headers: { 'Accept': 'text/html' } });
+              if (r.status === 403 || r.status === 429) return { block: 'http ' + r.status };
+              if (!r.ok) return { err: 'http ' + r.status };
+              // Read the body while the abort signal is still armed — an aborted
+              // signal also rejects an in-progress text(), so the 30s cap covers
+              // headers AND body (a trickling body can otherwise hang the evaluate).
+              html = await r.text();
+            } finally { clearTimeout(tid); }
+
+            // Single ld+json JobPosting block → full plain-text description.
+            const m = html.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>(.*?)<\/script>/s);
+            if (!m) {
+              // Challenge/interstitial pages carry no JobPosting ld+json; their markers
+              // sit in <head>/title, so check the leading chunk only (avoids false hits
+              // deep in a legit offer's 790 KB flight payload).
+              const low = html.slice(0, 6000).toLowerCase();
+              const mark = BLOCK.find(b => low.includes(b));
+              if (mark) return { block: 'block-signal: ' + mark };
+              return { err: 'ld+json not found' };
+            }
+            let ld = null;
+            try { ld = JSON.parse(m[1]); } catch (e) { return { err: 'ld+json parse: ' + e.message }; }
+
+            const fields = {};
+            let desc = (ld && ld.description) ? String(ld.description) : '';
+            if (desc) {
+              // Already plain text, but run through DOMParser anyway: decodes entities,
+              // strips any residual tags. textContent keeps the \n structure.
+              try {
+                const doc = new DOMParser().parseFromString(desc, 'text/html');
+                desc = (doc && doc.body ? (doc.body.textContent || '') : desc);
+              } catch (e) {}
+              desc = desc.replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim().slice(0, 15000);
+            }
+            fields.description = desc || null;
+
+            // Bonus (best-effort): skills with levels from the RSC flight payload —
+            // the list API returns these as null. Omit keys on any failure.
+            try {
+              const grab = (re) => {
+                const mm = html.match(re);
+                if (!mm) return null;
+                const arr = JSON.parse('[' + mm[1].replace(/\\"/g, '"') + ']');
+                const out = arr.map(s => (s && s.name)
+                  ? (s.name + ((s.level !== undefined && s.level !== null) ? ' (level ' + s.level + ')' : ''))
+                  : null).filter(Boolean);
+                return out.length ? out : null;
+              };
+              const reqS = grab(/\\"requiredSkills\\":\[([^\]]*)\]/);
+              const niceS = grab(/\\"niceToHaveSkills\\":\[([^\]]*)\]/);
+              if (reqS) fields.skills_required = reqS;
+              if (niceS) fields.skills_nice = niceS;
+            } catch (e) {}
+
+            return { fields };
+          } catch (e) {
+            return { err: String((e && e.message) || e).slice(0, 120) };
+          }
+        }, off.url, BLOCK);
+      } catch (e) {
+        res = { err: 'evaluate: ' + String((e && e.message) || e).slice(0, 100) };
+      }
+      if (!res) res = { err: 'no result' };
+
+      if (res.block) {
+        // Block signal / 403 / 429 → stop the detail phase, keep everything so far.
+        off.description = off.description || null;
+        off.detail_error = String(res.block).slice(0, 120);
+        detail_errors++;
+        detailAborted = true;
+        break;
+      }
+      if (res.err || !res.fields) {
+        off.description = off.description || null;
+        off.detail_error = String(res.err || 'no fields').slice(0, 120);
+        detail_errors++;
+        continue;
+      }
+
+      const f = res.fields;
+      if (typeof f.description !== 'string' || !f.description) {
+        off.description = null;
+        off.detail_error = 'empty description';
+        detail_errors++;
+        continue;
+      }
+      Object.assign(off, f);
+      details_fetched++;
+      // Only cache successes (non-empty description) — never cache failures.
+      cache[key] = { t: Date.now(), f };
+    }
+  } catch (e) {}
+
+  // Write cache once at the end (best-effort; keeps partial progress after abort too).
+  try { fs.writeFileSync(CACHE_PATH, JSON.stringify(cache)); } catch (e) {}
+}
+
 try { fs.writeFileSync(cfg.collectDir + '/justjoin.json', JSON.stringify({ source: 'justjoin', count: offers.length, offers })); } catch (e) {}
 try { await page.close(); } catch (e) {}
-return [{ json: { site: 'justjoin', count: offers.length, blocked } }];
+return [{ json: { site: 'justjoin', count: offers.length, blocked, details_fetched, details_cached, detail_errors, detailAborted } }];

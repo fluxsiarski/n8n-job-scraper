@@ -1,6 +1,6 @@
 # Screenshots
 
-Drop three PNGs in this folder and they'll appear automatically in the main `README.md`:
+These three PNGs are embedded in the main `README.md`. To refresh one, replace the file (keep the same name):
 
 | filename | what to capture |
 |---|---|

@@ -1,6 +1,8 @@
 // ===== EXCEL WRITER — appends a new dated+hour tab (Tracker style) to the master =====
 // No cross-tab dedup: EVERY offer from this run is saved (within-run dupes by URL removed).
 // Claude Code later builds a profile-filtered / deduped shortlist tab.
+// V3: additionally exports the FULL offers (incl. description) to JSON for the AI step.
+// Descriptions are NEVER written into the xlsx (Excel 32,767-char cell cap + file bloat).
 const ExcelJS = require('exceljs');
 const fs = require('fs');
 
@@ -62,7 +64,7 @@ COLS.forEach((c, i) => {
   cell.alignment = { vertical: 'middle', wrapText: true };
 });
 
-// data rows
+// data rows — description is deliberately NOT written to any cell
 offers.forEach((o, ri) => {
   const rn = ri + 2;
   ws.getCell(`A${rn}`).value = ri + 1;
@@ -101,6 +103,27 @@ ws.addConditionalFormatting({ ref: `I2:I${lastRow}`, rules: mkRules('I', [
   ['Techniczne', 'FFCFE0F5', 'FF1B4F7A'], ['Fizyczne/usługowe', 'FFC9E4C5', 'FF1E5631'], ['Marketingowe', 'FFFCE9B0', 'FF7A5B00'], ['Nie wysłane', 'FFF8C7C7', 'FF8A1F1F']
 ]) });
 
+// --- 5. JSON full-export for the AI step (BEFORE the xlsx write; each path guarded
+//        with try/catch so a JSON failure never blocks the xlsx and vice versa) ---
+const JSON_LATEST = '/output/oferty_full_latest.json';
+let jsonFile = null;
+let jsonLatest = null;
+try {
+  // same 'now' as the tab stamp → files pair up with the worksheet
+  // (same collision suffix as the tab, so two runs in one minute don't overwrite each other)
+  const stampFile = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}${k > 1 ? `_${k}` : ''}`;
+  try { fs.mkdirSync('/output/full', { recursive: true }); } catch (e) {}
+  // url_key = same nurl as the dedup key, so AI results join 1:1 with tracker rows
+  const exportOffers = offers.map(o => ({ ...o, url_key: nurl(o.url) }));
+  const payload = JSON.stringify({ run_tab: name, generated_at: new Date().toISOString(), count: offers.length, offers: exportOffers }, null, 1);
+  const dated = `/output/full/oferty_full_${stampFile}.json`;
+  fs.writeFileSync(dated, payload);
+  jsonFile = dated;
+  try { fs.writeFileSync(JSON_LATEST, payload); jsonLatest = JSON_LATEST; } catch (e) {}
+} catch (e) {}
+
+const withDescription = offers.filter(o => typeof o.description === 'string' && o.description.trim() !== '').length;
+
 const buf = await wb.xlsx.writeBuffer();
 fs.writeFileSync(MASTER, buf);
-return [{ json: { tab: name, offers: offers.length, master: MASTER } }];
+return [{ json: { tab: name, offers: offers.length, master: MASTER, json_file: jsonFile, json_latest: jsonLatest, with_description: withDescription } }];

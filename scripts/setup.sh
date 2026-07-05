@@ -19,5 +19,5 @@ until curl -sf http://localhost:5678/healthz >/dev/null 2>&1; do sleep 2; done
 echo ""
 echo "✅ Done. Next:"
 echo "   1. Open http://localhost:5678 (create your local owner account)"
-echo "   2. Import workflow/Job_Scraper_v2.json  (Workflows → Import from File)"
+echo "   2. Import workflow/Job_Scraper_v3.json  (Workflows → Import from File)"
 echo "   3. Open the 'Konfiguracja' node, set your filters, Save, and Execute."

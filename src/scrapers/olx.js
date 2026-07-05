@@ -1,10 +1,18 @@
-// ====== OLX.pl Praca — n8n Puppeteer (Browserless) ======
+// ====== OLX.pl Praca — n8n Puppeteer (Browserless) — V3: full descriptions ======
 // Adapted from the proven /tmp/old_scrapers/OLX.js:
 //  - KEEP: card selectors, gradual scroll, page-until-empty pagination,
 //    dedupe, cookie accept (#onetrust-accept-btn-handler).
-//  - ADD (contract): cfg-driven URL (keyword+category+location+radius),
+//  - KEEP (contract): cfg-driven URL (keyword+category+location+radius),
 //    random pre-nav delay, randomized inter-page/scroll delays, block
 //    detection, common offer shape, write to collect file, return status.
+//  - ADD (V3): detail phase after the list loop — for each uncached offer,
+//    one page.evaluate -> fetch('https://www.olx.pl/api/v1/offers/{id}')
+//    (same-origin, DataDome cookies ride along; verified live). Fills:
+//    description (HTML stripped via DOMParser), company (user.name — was
+//    always null before), contract_type / experience_level / salary from
+//    params[] when null. Description cache keyed by nurl(url) in
+//    cfg.descCache. Jittered 1500-3000ms between calls; abort-on-block;
+//    per-offer error tolerance. Total detail failure still yields V2 output.
 // DataDome is BEHAVIORAL — scroll gradually, delays are randomized, no retry hammering.
 
 const fs = require('fs');
@@ -12,7 +20,7 @@ const path = require('path');
 
 // --- 1. Config ---
 const cfg = JSON.parse(fs.readFileSync('/tmp/scrape_config.json', 'utf-8'));
-// cfg = { keyword, category, location, radius, collectDir }
+// cfg = { keyword, category, location, radius, collectDir, descCache }
 
 // --- helpers ---
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -36,7 +44,7 @@ function slugify(s, fallback) {
 function parseSalary(raw) {
   const out = {};
   if (!raw) return out;
-  const cleaned = String(raw).replace(/ /g, ' ');
+  const cleaned = String(raw).replace(/ /g, ' ');
   let currency;
   if (/zł|pln/i.test(cleaned)) currency = 'PLN';
   else if (/eur|€/i.test(cleaned)) currency = 'EUR';
@@ -189,6 +197,8 @@ try {
         experience_level: null,
         published_at: o.dateText || null,
         remote: remote,
+        description: null,   // V3: filled by detail phase below
+        _id: o.id || null,   // V3: numeric ad id for the detail API (temp, removed before write)
       });
       added++;
     }
@@ -204,13 +214,180 @@ try {
   console.log('OLX: unexpected error — ' + (err && err.message ? err.message : err));
 }
 
-// --- 6. Always write results (even when empty/blocked) ---
+// --- 6. Detail phase (V3): descriptions via OLX JSON API ---
+// GET https://www.olx.pl/api/v1/offers/{numeric-ad-id} -> {data:{description
+// (full HTML), user.name (company), params[] (salary/agreement/type/experience)}}.
+// Verified live. One page.evaluate per fetch (protocolTimeout-safe), all delays
+// in Node context. Cache keyed by nurl(url) — matches Excel Writer's dedup key.
+const CACHE_PATH = cfg.descCache || '/output/desc_cache.json';
+const nurl = (u) => String(u || '').split('?')[0].replace(/\/+$/, '').toLowerCase();
+
+let details_fetched = 0, details_cached = 0, detail_errors = 0, detailAborted = false;
+
+let descCache = {};
+try {
+  descCache = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf-8'));
+  if (!descCache || typeof descCache !== 'object' || Array.isArray(descCache)) descCache = {};
+} catch (e) { descCache = {}; }
+
+const onOlx = /(^|\.)olx\.pl/i.test(page.url()) || page.url().includes('olx.pl');
+if (!blocked && offers.length > 0 && onOlx) {
+  try {
+    let firstFetch = true;
+    for (const offer of offers) {
+      if (detailAborted) break;
+      if (!offer.url) continue; // no url — no cache key, skip detail fetch
+
+      // 6a. Cache hit -> reuse (only entries with a real description are cached)
+      const key = nurl(offer.url);
+      const hit = descCache[key];
+      if (hit && hit.f && typeof hit.f.description === 'string' && hit.f.description) {
+        Object.assign(offer, hit.f);
+        details_cached++;
+        continue;
+      }
+
+      // 6b. Need the numeric ad id from the list card
+      const adId = (String(offer._id || '').match(/\d{6,}/) || [])[0];
+      if (!adId) {
+        offer.detail_error = 'no ad id on card';
+        detail_errors++;
+        continue;
+      }
+
+      // 6c. Jittered delay BETWEEN calls, in Node context (DataDome is behavioral)
+      if (!firstFetch) await sleep(rand(1500, 3000));
+      firstFetch = false;
+
+      // 6d. One evaluate = one fetch (same-origin, cookies ride along)
+      let det;
+      try {
+        det = await page.evaluate(async (apiUrl) => {
+          const out = { ok: false, status: 0, description: null, company: null, params: [], snippet: '', error: null };
+          try {
+            const ctl = new AbortController();
+            const timer = setTimeout(() => ctl.abort(), 25000); // keep this evaluate well under 60s
+            const r = await fetch(apiUrl, { headers: { Accept: 'application/json' }, credentials: 'include', signal: ctl.signal });
+            clearTimeout(timer);
+            out.status = r.status;
+            const text = await r.text();
+            let json = null;
+            try { json = JSON.parse(text); } catch (e) {}
+            if (!json || !json.data) {
+              out.snippet = String(text || '').slice(0, 600); // for block-signal check node-side
+              return out;
+            }
+            const d = json.data;
+            if (d.description) {
+              // Keep line breaks: <br>/<p>/<li> -> \n before DOMParser strips tags
+              const html = String(d.description)
+                .replace(/<br\s*\/?>/gi, '\n')
+                .replace(/<\/(p|li|div|h[1-6]|ul|ol|tr)>/gi, '\n')
+                .replace(/<li[^>]*>/gi, '- ');
+              try {
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                out.description = doc.body ? (doc.body.textContent || '') : '';
+              } catch (e) {
+                out.description = html.replace(/<[^>]*>/g, ' ');
+              }
+            }
+            out.company = d.user && d.user.name ? String(d.user.name).trim() : null;
+            if (Array.isArray(d.params)) {
+              out.params = d.params.map((p) => ({
+                key: p && p.key ? String(p.key) : null,
+                label: p && p.value && p.value.label != null ? String(p.value.label) : null,
+                from: p && p.value && p.value.from != null ? p.value.from : null,
+                to: p && p.value && p.value.to != null ? p.value.to : null,
+                currency: p && p.value && p.value.currency ? String(p.value.currency) : null,
+              }));
+            }
+            out.ok = true;
+            return out;
+          } catch (e) {
+            out.error = e && e.message ? e.message : String(e);
+            return out;
+          }
+        }, 'https://www.olx.pl/api/v1/offers/' + adId);
+      } catch (e) {
+        offer.detail_error = 'evaluate failed: ' + (e && e.message ? e.message : e);
+        detail_errors++;
+        continue;
+      }
+
+      // 6e. Block handling: 403/429 or challenge text -> STOP, keep everything so far
+      const snippetLower = String((det && det.snippet) || '').toLowerCase();
+      if (det && (det.status === 403 || det.status === 429 || BLOCK_SIGNALS.some((s) => snippetLower.includes(s)))) {
+        detailAborted = true;
+        console.log('OLX detail: block signal (HTTP ' + det.status + ') on ad ' + adId + ' — aborting detail phase, keeping list data.');
+        break;
+      }
+
+      // 6f. Per-offer failure (non-block) -> tag & continue
+      if (!det || !det.ok) {
+        offer.detail_error = 'HTTP ' + (det ? det.status : '?') + (det && det.error ? ' / ' + det.error : '');
+        detail_errors++;
+        continue;
+      }
+
+      // 6g. Build the fields object (goes onto the offer AND into the cache)
+      const fields = {};
+      let desc = det.description != null ? String(det.description) : '';
+      desc = desc.replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim().slice(0, 15000);
+      fields.description = desc || null;
+
+      if (det.company) fields.company = det.company; // FIXES the always-null company
+
+      const byKey = {};
+      for (const pp of (det.params || [])) { if (pp && pp.key && !(pp.key in byKey)) byKey[pp.key] = pp; }
+      const agreement = byKey['agreement'] || byKey['type'];
+      if (agreement && agreement.label) fields.contract_type = agreement.label;
+      if (byKey['experience'] && byKey['experience'].label) fields.experience_level = byKey['experience'].label;
+      // Salary from API only when the list card had none
+      if (offer.salary_from == null && byKey['salary']) {
+        const s = byKey['salary'];
+        if (s.from != null) fields.salary_from = s.from;
+        if (s.to != null) fields.salary_to = s.to;
+        if (s.currency) fields.salary_currency = s.currency;
+      }
+
+      // Assign to offer — fill only fields that are currently null (never clobber list data)
+      for (const k of Object.keys(fields)) {
+        if (fields[k] != null && offer[k] == null) offer[k] = fields[k];
+      }
+      details_fetched++;
+
+      // Cache ONLY entries with a non-empty description (never cache failures)
+      if (typeof fields.description === 'string' && fields.description) {
+        descCache[key] = { t: Date.now(), f: fields };
+      }
+    }
+  } catch (err) {
+    // Total detail-phase failure must still produce V2-equivalent output
+    console.log('OLX detail: unexpected error — ' + (err && err.message ? err.message : err));
+  }
+
+  // 6h. Write cache once, best-effort
+  try {
+    try { fs.mkdirSync(path.dirname(CACHE_PATH), { recursive: true }); } catch (e) {}
+    fs.writeFileSync(CACHE_PATH, JSON.stringify(descCache));
+  } catch (e) {}
+
+  console.log('OLX detail: fetched ' + details_fetched + ', cached ' + details_cached +
+    ', errors ' + detail_errors + (detailAborted ? ', ABORTED on block' : '') + '.');
+} else if (!blocked && offers.length > 0) {
+  console.log('OLX detail: page is not on olx.pl (nav failed?) — skipping detail phase.');
+}
+
+// Drop the temp _id before writing (cache is keyed by url; collect shape stays clean)
+for (const o of offers) delete o._id;
+
+// --- 7. Always write results (even when empty/blocked) ---
 try { fs.mkdirSync(cfg.collectDir, { recursive: true }); } catch (e) {}
 fs.writeFileSync(
   path.join(cfg.collectDir, 'olx.json'),
   JSON.stringify({ source: 'olx', count: offers.length, offers })
 );
 
-// --- 7. Close + return status ---
+// --- 8. Close + return status ---
 await page.close();
-return [{ json: { site: 'olx', count: offers.length, blocked } }];
+return [{ json: { site: 'olx', count: offers.length, blocked, details_fetched, details_cached, detail_errors, detailAborted } }];

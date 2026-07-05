@@ -29,6 +29,23 @@ const collectDir = '/tmp/scrape_run';
 try { fs.rmSync(collectDir, { recursive: true, force: true }); } catch (e) {}
 fs.mkdirSync(collectDir, { recursive: true });
 
-const cfg = { ...search, urls, collectDir };
+const cfg = { ...search, urls, collectDir, descCache: '/output/desc_cache.json' };
 fs.writeFileSync('/tmp/scrape_config.json', JSON.stringify(cfg));
+
+// --- Utrzymanie cache opisów: usuń wpisy starsze niż 60 dni ---
+// Błędy cache NIGDY nie mogą przerwać przebiegu — wszystko w try/catch.
+try {
+  let cache = {};
+  try { cache = JSON.parse(fs.readFileSync(cfg.descCache, 'utf8')); } catch (e) { cache = {}; }
+  const cutoff = Date.now() - 60 * 24 * 3600 * 1000;
+  for (const key of Object.keys(cache)) {
+    if (!cache[key] || !cache[key].t || cache[key].t < cutoff) delete cache[key];
+  }
+  fs.writeFileSync(cfg.descCache, JSON.stringify(cache));
+} catch (e) {
+  // Ostatnia deska ratunku: zapisz pusty cache, żeby kolejne node'y zawsze
+  // znalazły plik. Jeśli i to się nie uda — trudno, jedziemy dalej.
+  try { fs.writeFileSync(cfg.descCache, '{}'); } catch (e2) {}
+}
+
 return [{ json: cfg }];

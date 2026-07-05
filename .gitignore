@@ -5,6 +5,14 @@ n8n_data/
 output/
 *.xlsx
 *.xls
+desc_cache.json
+
+# --- personal profile, AI-filtering config & local notes — NEVER commit ---
+my-profile/
+.analysis/
+.v3/
+.claude/
+*.local.json
 
 # --- misc ---
 node_modules/
